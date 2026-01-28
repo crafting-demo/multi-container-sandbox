@@ -1,0 +1,145 @@
+overview: Demo sandbox with workspace + containers
+workspaces:
+- name: dev
+  system:
+    files:
+    - path: /home/owner/demo/run_demo.sh
+      mode: "0755"
+      overwrite: true
+      content: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+
+        # ---- constants (inter-workload connectivity) ------------------------
+        # Hostnames are workload names. These resolve inside the sandbox network.
+        MYSQL_HOST="mysql"
+        MYSQL_PORT="3306"
+        MYSQL_USER="root"
+        MYSQL_PASS="example"
+        MYSQL_DB="demo"
+
+        MINIO_HOST="minio"
+        MINIO_PORT="9000"
+        MINIO_CONSOLE_PORT="9001"
+        MINIO_USER="minio"
+        MINIO_PASS="minio123"
+
+        LOG_DIR="/home/owner/demo-logs"
+        LOG_FILE="$LOG_DIR/demo.log"
+        DONE_FILE="$LOG_DIR/.demo_done"
+        mkdir -p "$LOG_DIR"
+
+        if [ -f "$DONE_FILE" ]; then
+          echo "Demo already ran; exiting."
+          exit 0
+        fi
+
+        log() {
+          echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] $*" | tee -a "$LOG_FILE"
+        }
+
+        ensure_cmd() {
+          local cmd="$1"
+          if command -v "$cmd" >/dev/null 2>&1; then
+            return 0
+          fi
+          log "Installing missing command: $cmd"
+          sudo apt-get update
+          case "$cmd" in
+            curl) sudo apt-get install -y curl ;;
+            nc) sudo apt-get install -y netcat-openbsd ;;
+            mysql) sudo apt-get install -y mysql-client ;;
+            *) log "Unknown command install: $cmd"; return 1 ;;
+          esac
+        }
+
+        ensure_cmd curl
+        ensure_cmd nc
+        ensure_cmd mysql
+
+        # Port mapping for the MySQL container is defined under containers.mysql.ports.
+        log "Waiting for MySQL (${MYSQL_HOST}:${MYSQL_PORT})..."
+        for _ in $(seq 1 60); do
+          if nc -z "$MYSQL_HOST" "$MYSQL_PORT"; then
+            break
+          fi
+          sleep 2
+        done
+
+        log "Running MySQL demo queries..."
+        MYSQL_OPTS=()
+        if mysql --help 2>/dev/null | grep -q -- "--ssl-mode"; then
+          MYSQL_OPTS+=(--ssl-mode=DISABLED)
+        else
+          MYSQL_OPTS+=(--ssl=0)
+        fi
+        MYSQL_BASE=(mysql -h "$MYSQL_HOST" -P "$MYSQL_PORT" -u "$MYSQL_USER" -p"$MYSQL_PASS" "${MYSQL_OPTS[@]}")
+        "${MYSQL_BASE[@]}" -e "CREATE DATABASE IF NOT EXISTS ${MYSQL_DB};"
+        "${MYSQL_BASE[@]}" -e "CREATE TABLE IF NOT EXISTS ${MYSQL_DB}.proof (id INT PRIMARY KEY, note VARCHAR(255));"
+        "${MYSQL_BASE[@]}" -e "INSERT INTO ${MYSQL_DB}.proof (id, note) VALUES (1, 'hello from sandbox') ON DUPLICATE KEY UPDATE note=VALUES(note);"
+        "${MYSQL_BASE[@]}" -e "SELECT * FROM ${MYSQL_DB}.proof;"
+
+        # MinIO port/console ports are defined under containers.minio.ports.
+        log "Waiting for MinIO (${MINIO_HOST}:${MINIO_PORT})..."
+        for _ in $(seq 1 60); do
+          if curl -fsS "http://${MINIO_HOST}:${MINIO_PORT}/minio/health/ready" >/dev/null; then
+            break
+          fi
+          sleep 2
+        done
+
+        log "Downloading MinIO client..."
+        MC_BIN="$HOME/.local/bin/mc"
+        mkdir -p "$(dirname "$MC_BIN")"
+        curl -fsSLo "$MC_BIN" "https://dl.min.io/client/mc/release/linux-amd64/mc"
+        chmod +x "$MC_BIN"
+
+        log "Running MinIO demo commands..."
+        export MC_HOST_demo="http://${MINIO_USER}:${MINIO_PASS}@${MINIO_HOST}:${MINIO_PORT}"
+        "$MC_BIN" mb --ignore-existing demo/proof-bucket
+        echo "sandbox proof $(date -u +"%Y-%m-%dT%H:%M:%SZ")" > /tmp/proof.txt
+        "$MC_BIN" cp /tmp/proof.txt demo/proof-bucket/proof.txt
+        "$MC_BIN" ls demo/proof-bucket
+
+        log "Demo complete. Logs at $LOG_FILE"
+        touch "$DONE_FILE"
+    daemons:
+    - name: demo-proof
+      run:
+        cmd: bash /home/owner/demo/run_demo.sh
+containers:
+- name: mysql
+  image: mysql:8.0
+  env:
+  - MYSQL_ROOT_PASSWORD=example
+  - MYSQL_DATABASE=appdb
+  ports:
+  - name: mysql
+    port: 3306
+    protocol: TCP
+  volume_mounts:
+  - name: mysql-data
+    path: /var/lib/mysql
+- name: minio
+  image: minio/minio:latest
+  args:
+  - server
+  - /data
+  - --console-address
+  - :9001
+  env:
+  - MINIO_ROOT_USER=minio
+  - MINIO_ROOT_PASSWORD=minio123
+  ports:
+  - name: minio
+    port: 9000
+    protocol: HTTP/TCP
+  - name: minio-console
+    port: 9001
+    protocol: HTTP/TCP
+  volume_mounts:
+  - name: minio-data
+    path: /data
+volumes:
+- name: mysql-data
+- name: minio-data
